@@ -15,7 +15,8 @@ This document walks through the codebase layer by layer, explaining **why** each
 7. [Angular Routing — Pages, Guards & Lazy Loading](#7-angular-routing)
 8. [Angular Forms — Reactive Forms](#8-angular-forms)
 9. [End-to-End Login Flow](#9-end-to-end-login-flow)
-10. [Key Concepts Cheat Sheet](#10-key-concepts-cheat-sheet)
+10. [Docker & Containers](#10-docker--containers)
+11. [Key Concepts Cheat Sheet](#11-key-concepts-cheat-sheet)
 
 ---
 
@@ -692,7 +693,244 @@ LoginComponent.submit()
 
 ---
 
-## 10. Key Concepts Cheat Sheet
+## 10. Docker & Containers
+
+### What is Docker?
+
+Docker packages an application and everything it needs to run (Node.js runtime, OS libraries, config) into a single portable unit called a **container**. Containers run identically on any machine — your laptop, a teammate's computer, or a cloud server.
+
+```
+Without Docker                      With Docker
+────────────────────────────────    ──────────────────────────────────
+"works on my machine"               same image runs everywhere
+manual Node.js version management   Node version pinned inside the image
+manual MongoDB install              mongo runs as a container
+different configs per environment   config passed via environment vars
+```
+
+### Core Concepts
+
+| Term | Meaning |
+|---|---|
+| **Image** | A read-only blueprint — like a class definition |
+| **Container** | A running instance of an image — like an object created from a class |
+| **Dockerfile** | A script that builds an image step by step |
+| **docker-compose** | A tool to run multiple containers together as one application |
+| **Volume** | A folder that persists data outside the container's lifecycle |
+| **Network** | Docker creates a private network so containers can talk to each other by name |
+
+---
+
+### The Backend Dockerfile — Multi-Stage Build
+
+```dockerfile
+# backend/Dockerfile
+
+# ── Stage 1: BUILD ──────────────────────────────────────────────────────────
+FROM node:20-alpine AS build   # base image: Node 20 on minimal Alpine Linux
+WORKDIR /app                   # all following commands run from /app
+
+COPY package*.json ./          # copy only package files first (layer cache trick — see below)
+RUN npm ci                     # install ALL dependencies (including devDependencies)
+
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build              # tsc compiles TypeScript → JavaScript in /app/dist
+
+# ── Stage 2: RUNTIME ────────────────────────────────────────────────────────
+FROM node:20-alpine            # fresh image — Stage 1 is discarded after this
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev          # install ONLY production dependencies (no TypeScript, ts-node, etc.)
+
+COPY --from=build /app/dist ./dist   # copy only the compiled JS from Stage 1
+
+EXPOSE 3000
+CMD ["node", "dist/server.js"]       # the command that runs when the container starts
+```
+
+**Why two stages?** Stage 1 needs TypeScript, `ts-node`, and all dev tools to compile the code. The final image only needs the compiled JavaScript and production packages. Without multi-stage builds, the image would carry all those dev tools into production — making it much larger and exposing unnecessary attack surface.
+
+**The layer cache trick:** Docker caches each `RUN`/`COPY` step as a layer. Copying `package*.json` before the source code means `npm ci` is only re-run when `package.json` changes — not on every code change. Source files change frequently; dependencies rarely do.
+
+```
+Layer 1: FROM node:20-alpine         (never changes — cached)
+Layer 2: COPY package*.json          (changes only when deps change)
+Layer 3: RUN npm ci                  (re-runs only when layer 2 changes)
+Layer 4: COPY src                    (changes on every code edit)
+Layer 5: RUN npm run build           (re-runs only when layer 4 changes)
+```
+
+---
+
+### The Frontend Dockerfile — Angular + nginx
+
+```dockerfile
+# frontend/Dockerfile
+
+# ── Stage 1: BUILD ──────────────────────────────────────────────────────────
+FROM node:20-alpine AS build
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build -- --configuration production   # Angular CLI produces static HTML/CSS/JS
+
+# ── Stage 2: SERVE ──────────────────────────────────────────────────────────
+FROM nginx:alpine                                  # tiny nginx web server image
+COPY --from=build /app/dist/frontend/browser /usr/share/nginx/html   # copy built app
+COPY nginx.conf /etc/nginx/conf.d/default.conf     # replace default nginx config
+
+EXPOSE 80
+```
+
+Angular's build output is just static files (HTML, CSS, JavaScript). There is no Node.js process needed to serve them — nginx serves them directly, which is far more efficient. The final image is roughly 25 MB vs ~200 MB for a Node.js image.
+
+---
+
+### nginx — Two Jobs in One Config
+
+nginx serves the Angular app **and** proxies API requests to the backend:
+
+```nginx
+# frontend/nginx.conf
+
+server {
+    listen 80;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Job 1 — API proxy
+    # Requests to /api/* are forwarded to the backend container internally.
+    # The browser thinks it's talking to the same server — no CORS needed.
+    location /api/ {
+        proxy_pass         http://backend:3000/api/;
+        #                  ^^^^^^^^^ Docker DNS: "backend" resolves to the backend container
+        proxy_http_version 1.1;
+        proxy_set_header   Host $host;
+        proxy_set_header   X-Real-IP $remote_addr;
+    }
+
+    # Job 2 — Angular SPA routing
+    # Any URL that isn't a real file (e.g. /dashboard, /login) serves index.html.
+    # Angular's router then reads the URL and renders the right component.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+```
+
+Without `try_files ... /index.html`, refreshing the browser on `/dashboard` would return a 404 — nginx would look for a real file called `dashboard` and find nothing. The directive tells nginx: "if the file doesn't exist, serve `index.html` and let Angular figure it out."
+
+---
+
+### docker-compose.yml — Orchestrating All Three Services
+
+```yaml
+# docker-compose.yml
+
+services:
+
+  mongo:
+    image: mongo:7             # use the official MongoDB image, no Dockerfile needed
+    restart: unless-stopped    # restart automatically if it crashes
+    volumes:
+      - mongo_data:/data/db    # /data/db inside the container is stored in the named volume
+                               # data survives container restarts and rebuilds
+
+  backend:
+    build: ./backend           # build image from backend/Dockerfile
+    restart: unless-stopped
+    environment:               # these become process.env.* inside the container
+      PORT: 3000
+      MONGO_URI: mongodb://mongo:27017/myapp   # "mongo" = the service name above
+      JWT_SECRET: hi_my_name_is_slim_shady
+      NODE_ENV: production
+    depends_on:
+      - mongo                  # Docker starts mongo before backend
+
+  frontend:
+    build: ./frontend          # build image from frontend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "4200:80"              # host:container — browser hits localhost:4200 → nginx port 80
+    depends_on:
+      - backend
+
+volumes:
+  mongo_data:                  # declares the named volume used above
+```
+
+---
+
+### Docker Networking — How Containers Find Each Other
+
+Docker Compose automatically creates a private network and registers each service name as a DNS hostname. Containers can reach each other using the service name as the host.
+
+```
+Host machine (your laptop)
+┌─────────────────────────────────────────────────────────┐
+│                                                         │
+│  localhost:4200 ──► frontend container (nginx :80)      │
+│                          │                              │
+│                          │  http://backend:3000/api/    │
+│                          ▼                              │
+│                     backend container (Express :3000)   │
+│                          │                              │
+│                          │  mongodb://mongo:27017        │
+│                          ▼                              │
+│                     mongo container (MongoDB :27017)    │
+│                                                         │
+│  NOTE: only port 4200 is open to the outside.           │
+│  backend and mongo are unreachable from the host.       │
+└─────────────────────────────────────────────────────────┘
+```
+
+This is why `MONGO_URI` says `mongodb://mongo:27017` and nginx says `proxy_pass http://backend:3000` — those names work inside Docker's network, not on your machine.
+
+---
+
+### .dockerignore — Speeding Up Builds
+
+`.dockerignore` works like `.gitignore` — it tells Docker what to skip when copying files into the build context. Without it, Docker would send `node_modules` (often hundreds of MB) to the build engine before the `COPY` step.
+
+```
+# backend/.dockerignore
+node_modules    ← never copy — npm ci inside the container installs fresh
+dist            ← never copy — we build fresh inside the container
+.env            ← never copy — secrets are passed via environment variables
+```
+
+---
+
+### Running the App with Docker
+
+```bash
+# Build all images and start all containers
+docker compose up --build
+
+# Run in the background
+docker compose up --build -d
+
+# View logs from all containers
+docker compose logs -f
+
+# View logs from one service
+docker compose logs -f backend
+
+# Stop everything
+docker compose down
+
+# Stop and delete the MongoDB volume (wipes all data)
+docker compose down -v
+```
+
+---
+
+## 11. Key Concepts Cheat Sheet
 
 ### MongoDB / Mongoose
 | Concept | One-liner |
@@ -741,3 +979,20 @@ LoginComponent.submit()
 | `{{ value }}` | Interpolation — renders a value as text |
 | `@if` | Built-in control flow for conditional rendering |
 | `FormGroup` / `FormControl` | Reactive form tree that tracks values and validation state |
+
+### Docker
+| Concept | One-liner |
+|---|---|
+| Image | A read-only snapshot of an app and its dependencies — built from a Dockerfile |
+| Container | A running instance of an image |
+| Multi-stage build | Use one stage to compile, a second stage for the lean runtime — keeps final images small |
+| `COPY --from=build` | Copies files from a previous build stage into the current one |
+| Layer cache | Docker reuses unchanged layers; copy `package.json` before source to avoid re-running `npm ci` on every code change |
+| `docker compose up --build` | Builds all images and starts all containers |
+| `depends_on` | Tells Compose to start a service only after its dependencies are running |
+| Named volume | A Docker-managed folder that persists data outside the container (used for MongoDB) |
+| Docker DNS | Service names in Compose are auto-registered as hostnames — `backend` resolves to the backend container |
+| `ports: "4200:80"` | Maps host port 4200 to container port 80 — only the frontend is exposed externally |
+| nginx `proxy_pass` | Forwards matching requests to another server — used to route `/api/*` to the backend internally |
+| `try_files $uri /index.html` | nginx fallback for Angular SPA routing — serves `index.html` for unknown paths |
+| `.dockerignore` | Excludes files from the build context — always exclude `node_modules` and `.env` |

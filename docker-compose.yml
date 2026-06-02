@@ -1,0 +1,36 @@
+services:
+
+  # ── MongoDB ────────────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db   # persist data between restarts
+    # port 27017 is intentionally not exposed to the host —
+    # only the backend container needs to reach it
+
+  # ── Express API ────────────────────────────────────────────────────────────
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      MONGO_URI: mongodb://mongo:27017/myapp   # "mongo" resolves via Docker DNS
+      JWT_SECRET: hi_my_name_is_slim_shady
+      NODE_ENV: production
+    depends_on:
+      - mongo
+    # port 3000 is intentionally not exposed to the host —
+    # nginx proxies /api/* to this container internally
+
+  # ── Angular (nginx) ────────────────────────────────────────────────────────
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "4200:80"   # visit http://localhost:4200
+    depends_on:
+      - backend
+
+volumes:
+  mongo_data:
