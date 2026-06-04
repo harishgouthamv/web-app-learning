@@ -3,6 +3,13 @@ import { Router } from '@angular/router';
 import { tap } from 'rxjs';
 import { ApiService } from './api.service';
 
+/** Shape of the response from POST /api/auth/register */
+interface RegisterResponse {
+  id: string;
+  email: string;
+  name: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class AuthService {
   private api = inject(ApiService);
@@ -19,6 +26,16 @@ export class AuthService {
         localStorage.setItem('token', token);
         this._loggedIn.set(true);
       })
+    );
+  }
+
+  /**
+   * Registers a new user. On success, navigates to /login so the user
+   * can sign in with their new credentials.
+   */
+  register(name: string, email: string, password: string) {
+    return this.api.post<RegisterResponse>('auth/register', { name, email, password }).pipe(
+      tap(() => this.router.navigate(['/login']))
     );
   }
 

@@ -1,4 +1,4 @@
-.login-container {
+.register-container {
   max-width: 360px;
   margin: 80px auto;
   padding: 2rem;
@@ -39,6 +39,8 @@ button {
 button:disabled { opacity: 0.6; cursor: not-allowed; }
 
 .error { color: #d32f2f; font-size: 0.875rem; }
+
+.hint { color: #f57c00; font-size: 0.75rem; }
 
 .footer-link {
   margin-top: 1.25rem;
