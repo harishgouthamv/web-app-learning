@@ -6,6 +6,7 @@ services:
     restart: unless-stopped
     volumes:
       - mongo_data:/data/db   # persist data between restarts
+      - ./test/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
     # port 27017 is intentionally not exposed to the host —
     # only the backend container needs to reach it
 
